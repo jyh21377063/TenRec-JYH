@@ -13,6 +13,7 @@ from datetime import datetime
 
 from dataset import SBRDataset
 from model.dssm.dssm import TwoTowerModel
+from model.sequence.sasrec import SASRecRecallModel
 from evaluation import Evaluator
 from loss import InfoNCELoss
 
@@ -29,7 +30,8 @@ CONFIG = {
     'exp_dir': '../../experiments',  # 实验结果根目录
     'main_metric': 'Recall@20',  # 用于判断模型好坏的主指标
     'weight_decay': 1e-5,  # 增加一点正则化
-    'tau': 0.1  # 温度系数
+    'tau': 0.1,  # 温度系数
+    'model': 'SAS'  # 模型：DSSM SAS
 }
 
 
@@ -202,7 +204,16 @@ def train():
     test_loader = DataLoader(test_ds, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=4)
 
     # 2. 初始化模型
-    model = TwoTowerModel(meta).to(device)
+    if CONFIG['model'] == 'SAS':
+        model = SASRecRecallModel(
+            meta_info=meta,
+            embed_dim=64,  # 可以根据需要调整
+            num_layers=2,  # Transformer 层数，2层通常对召回足够
+            num_heads=2,
+            dropout=0.1
+        ).to(device)
+    else:
+        model = TwoTowerModel(meta).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG['lr'], weight_decay=CONFIG['weight_decay'])
     criterion = InfoNCELoss(temperature=CONFIG['tau'])
 
