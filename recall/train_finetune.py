@@ -27,8 +27,8 @@ CONFIG = {
     'epochs': 10,
     'patience': 3,
     'data_path': '../../data/sbr_data_1208.pkl',
-    'hard_neg_path': '../../data/hard_negatives_train.npy',
-    'model_path': '../../experiments/EXP_20231208_123000/checkpoints/best_model.pth',
+    'hard_neg_path': '../../experiments/EXP_20251208_151742/data/hard_negatives_train.npy',
+    'model_path': '../../experiments/EXP_20251208_151742/checkpoints/best_model.pth',
     'tau': 0.1,
     'main_metric': 'Recall@20',
     'hard_neg_weight': 1.0
