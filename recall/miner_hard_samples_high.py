@@ -9,14 +9,16 @@ from torch.utils.data import DataLoader
 from dataset import SBRDataset
 from model.dssm.dssm import TwoTowerModel
 from model.sequence.sasrec import SASRecRecallModel
+from model.sequence.comirec import MINDModel
+from model.dssm.sas_dssm import GatingTwoTowerSASRec
 
 # ================= 配置 =================
 CONFIG = {
     'data_path': '/root/autodl-tmp/data/sbr_data_1208.pkl',
-    'model_path': '/root/autodl-tmp/data/1/best_model.pth',
-    'output_path': '/root/autodl-tmp/data/1/hard_negatives_train.npy',
+    'model_path': '/root/autodl-tmp/data/4/best_model.pth',
+    'output_path': '/root/autodl-tmp/data/4/hard_negatives_train.npy',
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    'model': 'SAS',
+    'model': 'MIND',
 
     # Batch Size 稍微调小一点，保证稳定性
     'batch_size': 4096,
@@ -101,6 +103,17 @@ def main():
             num_heads=2,
             dropout=0.1
         ).to(device)
+    elif CONFIG['model'] == 'MIND':
+        model = MINDModel(
+            meta_info=meta,
+            embed_dim=64,
+            num_layers=2,
+            num_heads=2,
+            dropout=0.1,
+            num_interests=4
+        ).to(device)
+    elif CONFIG['model'] == 'SASTT':
+        model = GatingTwoTowerSASRec(meta).to(device)
     else:
         model = TwoTowerModel(meta).to(device)
     checkpoint = torch.load(CONFIG['model_path'], map_location=device, weights_only=False)
@@ -148,22 +161,36 @@ def main():
                 batch[k] = v.to(device, non_blocking=True)
 
             u_emb = model.forward_user_tower(batch)
-            u_emb = torch.nn.functional.normalize(u_emb, p=2, dim=1)
+            u_emb = torch.nn.functional.normalize(u_emb, p=2, dim=-1)
 
-            # 转回 CPU
-            u_emb_np = u_emb.cpu().numpy()
+            B = u_emb.shape[0]
+            D = u_emb.shape[-1]
+
+            # 3. 统一变形为 [N, D] 给 FAISS
+            # 如果是 SASRec [B, D] -> view 后还是 [B, D] (N=B)
+            # 如果是 MIND   [B, K, D] -> view 后变成 [B*K, D] (N=B*K)
+            u_emb_flat = u_emb.view(-1, D).cpu().numpy()
+
+            # B. 立即检索 (FAISS 只认 2D)
+            # D_flat, I_flat 形状都是 [N, top_k]
+            D_flat, I_flat = index.search(u_emb_flat, CONFIG['top_k'])
+
+            # C. 结果还原
+            # 无论前面 N 是 B 还是 B*K，我们要把结果还原回每个 User 对应一行
+            # - 对于 SASRec: [B, top_k] -> reshape(B, -1) -> [B, top_k] (不变)
+            # - 对于 MIND:   [B*K, top_k] -> reshape(B, -1) -> [B, K*top_k] (自动把 K 个兴趣的结果横向拼起来)
+            I_reshaped = I_flat.reshape(B, -1)
+
             pos_batch = batch['item_id'].cpu().numpy().reshape(-1, 1)
 
-            # B. 立即检索 (CPU 多线程)
-            D, I = index.search(u_emb_np, CONFIG['top_k'])
-
             # C. 立即处理结果
-            mask = (I != pos_batch) & (I != 0)
+            mask = (I_reshaped != pos_batch) & (I_reshaped != 0)
 
             batch_res = []
-            for row_idx in range(len(I)):
-                valid_ids = I[row_idx][mask[row_idx]]
+            for row_idx in range(len(I_reshaped)):
+                valid_ids = I_reshaped[row_idx][mask[row_idx]]
 
+                valid_ids = np.unique(valid_ids) # 为mind去重
                 if len(valid_ids) >= CONFIG['top_k_save']:
                     batch_res.append(valid_ids[:CONFIG['top_k_save']])
                 else:

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sasrec import LayerNorm,TransformerBlock
+from .sasrec import LayerNorm,TransformerBlock
 
 
 class MultiInterestExtractor(nn.Module):
@@ -220,25 +220,29 @@ class MINDModel(nn.Module):
         return item_vec
 
     def forward(self, batch):
-        u_multi_emb = self.forward_user_tower(batch)  # [B, K, D]
+        # [B, K, D] -> 生成 K 个兴趣向量
+        u_multi_emb = self.forward_user_tower(batch)
+        u_multi_emb = F.normalize(u_multi_emb, p=2, dim=-1)
+
+        # 如果是推理模式 (Eval/Test)，直接返回所有兴趣向量
+        if not self.training:
+            return u_multi_emb  # Shape: [B, K, D]
+
+        # === 训练阶段 (Training) ===
         i_emb = self.forward_item_tower(batch)  # [B, D]
-        i_emb = F.normalize(i_emb, p=2, dim=1)
+        i_emb = F.normalize(i_emb, p=2, dim=-1)
 
-        if self.training:
-            # === 训练阶段 ===
-            # 计算每个兴趣胶囊与 Target Item 的相似度 [B, K]
-            att_scores = torch.matmul(u_multi_emb, i_emb.unsqueeze(-1)).squeeze(-1)
+        # Label-Aware Hard Selection (MIND 论文的核心训练策略)
+        # 1. 计算 K 个兴趣与 Target Item 的相似度: [B, K, D] * [B, D, 1] -> [B, K]
+        att_scores = torch.matmul(u_multi_emb, i_emb.unsqueeze(-1)).squeeze(-1)
 
-            # --- 改进点：使用 Hard Selection ---
-            # 选出最匹配的那个兴趣的索引
-            hard_indices = torch.argmax(att_scores, dim=1)  # [B]
+        # 2. 选出最匹配 Target Item 的那个兴趣 (Hard Selection)
+        hard_indices = torch.argmax(att_scores, dim=1)  # [B]
 
-            # 取出对应的兴趣向量 [B, D]
-            # 这种方式强制只有最接近真值的那个兴趣胶囊会被更新，促使其专门化
-            u_emb = u_multi_emb[torch.arange(u_multi_emb.size(0)), hard_indices]
+        # 3. 取出对应的兴趣向量
+        # gather 技巧: [B, K, D] -> [B, D]
+        # 解释: 我们需要从 dim=1 (K个兴趣) 中，根据 hard_indices 挑出那 1 个
+        hard_indices = hard_indices.view(-1, 1, 1).expand(-1, -1, self.embed_dim)
+        u_emb = torch.gather(u_multi_emb, 1, hard_indices).squeeze(1)
 
-            # 如果想保留 Soft 模式，可以设一个参数切换
-            # u_emb = self.label_attn(u_multi_emb, i_emb)
-
-            u_emb = F.normalize(u_emb, p=2, dim=1)
-            return u_emb, i_emb
+        return u_emb, i_emb

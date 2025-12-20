@@ -13,7 +13,9 @@ from datetime import datetime
 
 from dataset import SBRDataset
 from model.dssm.dssm import TwoTowerModel
+from model.dssm.sas_dssm import GatingTwoTowerSASRec
 from model.sequence.sasrec import SASRecRecallModel
+from model.sequence.comirec import MINDModel
 from evaluation import Evaluator
 from loss import InfoNCELoss
 
@@ -31,7 +33,7 @@ CONFIG = {
     'main_metric': 'Recall@20',  # 用于判断模型好坏的主指标
     'weight_decay': 1e-5,  # 增加一点正则化
     'tau': 0.1,  # 温度系数
-    'model': 'SAS'  # 模型：DSSM SAS
+    'model': 'SASTT',  # 模型：DSSM SAS MIND SASTT
 }
 
 
@@ -212,6 +214,17 @@ def train():
             num_heads=2,
             dropout=0.1
         ).to(device)
+    elif CONFIG['model'] == 'MIND':
+        model = MINDModel(
+            meta_info=meta,
+            embed_dim=64,
+            num_layers=2,
+            num_heads=2,
+            dropout=0.1,
+            num_interests=4
+        ).to(device)
+    elif CONFIG['model'] == 'SASTT':
+        model = GatingTwoTowerSASRec(meta).to(device)
     else:
         model = TwoTowerModel(meta).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG['lr'], weight_decay=CONFIG['weight_decay'])
