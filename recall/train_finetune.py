@@ -1,37 +1,50 @@
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
-import pickle
-import numpy as np
 import tqdm
 import json
 import logging
 import shutil
-from datetime import datetime
+import pickle
+import time
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import autocast, GradScaler
 
 from dataset import SBRDataset
-from model.dssm.dssm import TwoTowerModel
 from evaluation import Evaluator
 from train import EarlyStopping
 from loss import MixedInfoNCELoss
+from model.dssm.dssm import TwoTowerModel
+from model.dssm.sas_dssm import GatingTwoTowerSASRec
+from model.dssm.sas_dssm_simple import ConcatTwoTowerSASRec
+from model.dssm.sas_dssm_residual import ResidualSASRec
+from model.sequence.sasrec import SASRecRecallModel
+from model.sequence.comirec import MINDModel
 
-
-
+# ==========================
+# 1. 配置区域 (针对 5090 优化)
+# ==========================
 CONFIG = {
     'device': 'cuda',
-    'batch_size': 2048,
-    'lr': 1e-4,
+    # RTX 5090 90G 显存优化：
+    # 1. 极大 Batch Size 提高吞吐并优化对比学习效果
+    # 2. 开启混合精度 (AMP)
+    'batch_size': 16384,  # 如果显存还剩很多，可以尝试 32768
+    'num_workers': 8,  # 配合高速 CPU
+    'lr': 5e-5,  # 微调时学习率通常要比预训练小
     'epochs': 10,
     'patience': 3,
-    'data_path': '../../data/sbr_data_1208.pkl',
-    'hard_neg_path': '../../experiments/EXP_20251208_151742/data/hard_negatives_train.npy',
-    'model_path': '../../experiments/EXP_20251208_151742/checkpoints/best_model.pth',
+    'data_path': '/root/autodl-tmp/data/sbr_data_1208.pkl',
+
+    # 路径配置
+    'hard_neg_path': '/root/autodl-tmp/data/5/hard_negatives_train.npy',
+    'model_path': '/root/autodl-tmp/data/5/best_model.pth',
+
     'tau': 0.1,
     'main_metric': 'Recall@20',
-    'hard_neg_weight': 1.0
+    'hard_neg_weight': 1.0,
+    'use_compile': True,  # 是否使用 torch.compile 加速
 }
 
 
@@ -41,31 +54,34 @@ class FinetuneExperimentManager:
         self.metric_keys = [
             'Recall@10', 'Recall@20', 'Recall@50',
             'NDCG@10', 'NDCG@20', 'NDCG@50',
-            'MRR', 'Avg_Popularity@10', 'Cat_Diversity@10', 'coverage@10'
+            'MRR'
         ]
 
-        base_model_dir = os.path.dirname(config['model_path'])
-        self.exp_root = os.path.dirname(base_model_dir)
+        # 自动推导实验目录
+        base_model_dir = os.path.dirname(config['model_path'])  # checkpoints
+        self.exp_root = os.path.dirname(base_model_dir)  # EXP_xxx
 
-        self.run_dir = os.path.join(self.exp_root, 'finetune')
+        # 创建 finetune 子目录
+        timestamp = time.strftime("%H%M%S")
+        self.run_dir = os.path.join(self.exp_root, f'finetune_{timestamp}')
         self.ckpt_dir = os.path.join(self.run_dir, 'checkpoints')
         self.csv_path = os.path.join(self.run_dir, 'finetune_metrics.csv')
 
         os.makedirs(self.ckpt_dir, exist_ok=True)
-
         self.writer = SummaryWriter(log_dir=os.path.join(self.run_dir, 'tensorboard'))
-
         self._setup_logger()
 
+        # 保存配置
         with open(os.path.join(self.run_dir, 'finetune_config.json'), 'w') as f:
             json.dump(config, f, indent=4)
 
-        if not os.path.exists(self.csv_path):
-            with open(self.csv_path, 'w') as f:
-                header = "epoch,loss,phase," + ",".join(self.metric_keys) + "\n"
-                f.write(header)
+        # 初始化 CSV
+        with open(self.csv_path, 'w') as f:
+            header = "epoch,loss,phase," + ",".join(self.metric_keys) + "\n"
+            f.write(header)
 
-        self.logger.info(f"Finetune Experiment started. Saving to: {self.run_dir}")
+        self.logger.info(f"🚀 Finetune Experiment Started on {config['device']}")
+        self.logger.info(f"📂 Saving to: {self.run_dir}")
 
     def _setup_logger(self):
         self.logger = logging.getLogger('SBR_Finetune')
@@ -95,40 +111,65 @@ class FinetuneExperimentManager:
             f.write(line)
 
     def save_model(self, model, optimizer, epoch, metrics, is_best=False):
-        """保存模型到 finetune/checkpoints"""
+        # 如果模型被 compile 过，state_dict 会有前缀，通常 save 时需要注意，或者直接 save model.state_dict()
+        # 这里为了简单直接保存。如果用 DDP 需要 model.module
+        raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+
         state = {
             'epoch': epoch,
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': raw_model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'metrics': metrics,
             'config': self.config
         }
-        last_path = os.path.join(self.ckpt_dir, 'last_finetuned_model.pth')
+        last_path = os.path.join(self.ckpt_dir, 'last_finetuned.pth')
         torch.save(state, last_path)
 
         if is_best:
-            best_path = os.path.join(self.ckpt_dir, 'best_finetuned_model.pth')
+            best_path = os.path.join(self.ckpt_dir, 'best_finetuned.pth')
             shutil.copyfile(last_path, best_path)
-            self.logger.info(f" Best Finetuned model updated at Epoch {epoch}")
+            self.logger.info(f"🏆 Best Finetuned model updated at Epoch {epoch}")
 
+
+def get_model_instance(model_name, meta, device):
+    """根据名称工厂化创建模型"""
+    if model_name == 'SAS':
+        # 这里的参数需要和 train.py 保持一致，最好从 checkpoint config 里读
+        return SASRecRecallModel(meta_info=meta, embed_dim=64, num_layers=2, num_heads=2, dropout=0.1).to(device)
+    elif model_name == 'MIND':
+        return MINDModel(meta_info=meta, embed_dim=64, num_layers=2, num_heads=2, dropout=0.1, num_interests=4).to(
+            device)
+    elif model_name == 'SASTT':
+        return GatingTwoTowerSASRec(meta).to(device)
+    elif CONFIG['model'] == 'SSAS':
+        return ConcatTwoTowerSASRec(meta).to(device)
+    elif CONFIG['model'] == 'RSAS':
+        return ResidualSASRec(meta).to(device)
+    else:
+        # 默认 DSSM / TwoTower
+        return TwoTowerModel(meta).to(device)
 
 
 def train_finetune():
-    # 1. 初始化管理器
-    exp = FinetuneExperimentManager(CONFIG)
-    device = CONFIG['device']
+    torch.backends.cuda.matmul.allow_tf32 = True  # 允许 TF32，加速 30/40/50 系显卡
+    torch.backends.cudnn.benchmark = True  # 加速卷积/矩阵运算
 
-    exp.log_text("Loading Data with Hard Negatives...")
+    exp = FinetuneExperimentManager(CONFIG)
+    device = torch.device(CONFIG['device'])
+
+    # 1. 加载数据
+    exp.log_text("Loading Data...")
     with open(CONFIG['data_path'], 'rb') as f:
         all_data = pickle.load(f)
 
-    # 构造 Evaluator 需要的 dataset 格式
+    # 提取 meta (必须步骤)
+    # 临时实例化一个 dataset 来获取 meta，因为 meta 处理逻辑封装在 Dataset 里了
+    _temp_ds = SBRDataset(data=all_data, mode='train')
+    meta = _temp_ds.get_meta()
+
+    # 构造 Evaluator 用的 dict
     def extract_ids(mode_data):
         return {'user_id': mode_data['user_id'], 'item_id': mode_data['item_id']}
-
-    # 必须提取 meta，用于初始化模型
-    train_ds_temp = SBRDataset(data=all_data, mode='train')
-    meta = train_ds_temp.get_meta()
 
     full_dataset = {
         'train': extract_ids(all_data['train']),
@@ -137,138 +178,167 @@ def train_finetune():
         'meta': meta
     }
 
-    # DataLoader
+    # 2. DataLoader (性能优化关键点)
     train_ds = SBRDataset(data=all_data, mode='train', hard_neg_path=CONFIG['hard_neg_path'])
-    val_ds = SBRDataset(data=all_data, mode='val')  # Val 仅用于 Early Stopping
+    val_ds = SBRDataset(data=all_data, mode='val')
     test_ds = SBRDataset(data=all_data, mode='test')
 
-    train_loader = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_ds, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_ds, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=4)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=CONFIG['batch_size'],
+        shuffle=True,
+        num_workers=CONFIG['num_workers'],
+        pin_memory=True,  # 锁页内存，加速 CPU->GPU
+        persistent_workers=True,  # 避免每个 Epoch 重启 Worker
+        prefetch_factor=4  # 预取
+    )
+    val_loader = DataLoader(val_ds, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=CONFIG['batch_size'], shuffle=False, num_workers=4, pin_memory=True)
 
-    # 2. 加载预训练模型
-    exp.log_text(f"Loading Pre-trained Model from {CONFIG['model_path']}...")
-    model = TwoTowerModel(meta).to(device)
+    # 3. 智能加载模型
+    exp.log_text(f"🔍 Analyzing checkpoint: {CONFIG['model_path']}")
+    checkpoint = torch.load(CONFIG['model_path'], map_location=device, weights_only=False)
+
+    # 从 Checkpoint 的 config 中获取模型类型
+    saved_config = checkpoint.get('config', {})
+    model_type = saved_config.get('model', 'DSSM')  # 默认为 DSSM
+    exp.log_text(f"Detected Model Architecture: {model_type}")
+
+    # 实例化对应的模型
+    model = get_model_instance(model_type, meta, device)
 
     # 加载权重
-    checkpoint = torch.load(CONFIG['model_path'], map_location=device, weights_only=False)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    try:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        exp.log_text("✅ Model weights loaded successfully.")
+    except Exception as e:
+        exp.log_text(f"❌ Error loading weights: {e}")
+        return
 
-    # 3. 准备评估器 & 优化器
-    evaluator_val = Evaluator(model, full_dataset, device, k_list=[10, 20, 50])
-    evaluator_test = Evaluator(model, full_dataset, device, k_list=[10, 20, 50])
+    # 4. 编译模型 (针对 5090 的极端优化)
+    if CONFIG['use_compile'] and hasattr(torch, 'compile'):
+        exp.log_text("⚡ Compiling model with torch.compile (Mode: max-autotune)...")
+        # max-autotune 最快，但编译时间稍长
+        model = torch.compile(model, mode='max-autotune')
 
+    # 5. Loss, Optimizer, Scaler
     criterion = MixedInfoNCELoss(
         temperature=CONFIG['tau'],
         hard_neg_weight=CONFIG['hard_neg_weight']
     ).to(device)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG['lr'])
     early_stopper = EarlyStopping(patience=CONFIG['patience'])
 
+    # 混合精度 Scaler
+    scaler = GradScaler()
+
+    # 评估器
+    evaluator_val = Evaluator(model, full_dataset, device, k_list=[10, 20, 50])  # 验证集只看主要指标加速
+    evaluator_test = Evaluator(model, full_dataset, device, k_list=[10, 20, 50])
+
     global_step = 0
 
-    # 4. 微调循环
+    # 6. 训练循环
     for epoch in range(1, CONFIG['epochs'] + 1):
         model.train()
         total_loss = 0
         steps_in_epoch = 0
-        pbar = tqdm.tqdm(train_loader, desc=f"Finetune Epoch {epoch}")
+
+        pbar = tqdm.tqdm(train_loader, desc=f"Ep {epoch} (BS={CONFIG['batch_size']})", dynamic_ncols=True)
 
         for batch in pbar:
             for k, v in batch.items():
-                batch[k] = v.to(device)
+                batch[k] = v.to(device, non_blocking=True)  # non_blocking 配合 pin_memory
 
-            # --- A. Forward ---
-            u_emb = model.forward_user_tower(batch)  # (B, D)
-            i_pos_emb = model.forward_item_tower(batch)  # (B, D)
-
-            # --- B. Forward Hard Negatives (关键修改) ---
-            # 1. 获取维度信息
-            B, K = batch['hn_item_id'].shape  # e.g., 2048, 10
-
-            # 2. 构造 Flatten 后的 Batch
-            # 将 (B, K) -> (B*K)
-            hn_batch_flat = {
-                'item_id': batch['hn_item_id'].view(-1),  # (B*K, )
-                'video_category': batch['hn_video_category'].view(-1),  # (B*K, )
-                'item_pop_norm': batch['hn_item_pop_norm'].view(-1, 1)  # (B*K, 1)
-            }
-
-            # 3. 通过模型
-            i_neg_emb_flat = model.forward_item_tower(hn_batch_flat)  # (B*K, D)
-
-            # 4. 还原维度 -> (B, K, D)
-            i_neg_emb = i_neg_emb_flat.view(B, K, -1)
-
-            # --- C. Loss Calculation ---
-            loss = criterion(u_emb, i_pos_emb, i_neg_emb)
-
-            # --- C. Backward ---
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
 
-            # --- D. Log ---
+            # --- 混合精度上下文 ---
+            with autocast(dtype=torch.float16):  # 或者 torch.bfloat16
+                # A. 正样本
+                u_emb = model.forward_user_tower(batch)
+                i_pos_emb = model.forward_item_tower(batch)
+
+                # B. 负样本 (Flatten -> Forward -> Reshape)
+                B, K = batch['hn_item_id'].shape
+
+                # 构造 Flatten 后的 Batch (必须高效)
+                # 注意：这里假设 hard negative 数据字段都在 batch 里以 'hn_' 开头
+                hn_batch_flat = {
+                    'item_id': batch['hn_item_id'].view(-1),
+                    'video_category': batch['hn_video_category'].view(-1),
+                    'item_pop_norm': batch['hn_item_pop_norm'].view(-1, 1)
+                }
+
+                # 处理 item tower forward
+                i_neg_emb_flat = model.forward_item_tower(hn_batch_flat)
+                i_neg_emb = i_neg_emb_flat.view(B, K, -1)
+
+                # C. Loss
+                loss = criterion(u_emb, i_pos_emb, i_neg_emb)
+
+            # --- 反向传播 (Scaler) ---
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            # Logging
             loss_val = loss.item()
             total_loss += loss_val
             steps_in_epoch += 1
             global_step += 1
 
-            exp.log_scalar('Finetune/Step_Loss', loss_val, global_step)
-            pbar.set_postfix({'loss': loss_val})
+            if global_step % 10 == 0:
+                exp.log_scalar('Finetune/Step_Loss', loss_val, global_step)
+            pbar.set_postfix({'loss': f"{loss_val:.4f}"})
 
         avg_loss = total_loss / steps_in_epoch
         exp.log_scalar('Finetune/Avg_Loss', avg_loss, epoch)
         exp.log_text(f"Epoch {epoch} finished. Avg Loss: {avg_loss:.4f}")
 
-        # --- E. Evaluation ---
-        exp.log_text(f"Running Validation for Finetune Epoch {epoch}...")
+        # --- Validation ---
+        exp.log_text(f"Evaluating Epoch {epoch}...")
         val_results = evaluator_val.evaluate(val_loader)
 
-        # Log to TensorBoard
-        for k, v in val_results.items():
-            exp.log_scalar(f"Finetune_Eval/{k}", v, epoch)
-
-        # Log Text & CSV
-        res_str = f"[Val] Epoch {epoch}: " + ", ".join(
-            [f"{k}:{v:.4f}" for k, v in val_results.items() if 'Recall' in k])
+        # Log
+        res_str = f"[Val] Ep {epoch}: Recall@20: {val_results.get('Recall@20', 0):.4f}"
         exp.log_text(res_str)
-        exp.log_csv(epoch, avg_loss, val_results, phase='val')
+        exp.log_csv(epoch, avg_loss, val_results)
+        exp.save_model(model, optimizer, epoch, val_results, is_best=False)
 
-        # --- F. Checkpoint & Early Stopping ---
+        # Early Stop
         current_score = val_results[CONFIG['main_metric']]
-        is_best = early_stopper(current_score)
-
-        # 保存模型到 finetune 文件夹
-        exp.save_model(model, optimizer, epoch, val_results, is_best)
+        if early_stopper(current_score):
+            exp.save_model(model, optimizer, epoch, val_results, is_best=True)
 
         if early_stopper.early_stop:
-            exp.log_text(f"Early stopping triggered at epoch {epoch}")
+            exp.log_text("✋ Early stopping triggered.")
             break
 
     # ==========================
-    # 5. Final Test
+    # Final Test
     # ==========================
-    exp.log_text("Finetuning finished. Starting Final Test Evaluation...")
+    exp.log_text("🏁 Starting Final Test...")
+    best_path = os.path.join(exp.ckpt_dir, 'best_finetuned.pth')
+    if os.path.exists(best_path):
+        checkpoint = torch.load(best_path, weights_only=False)
+        exp.log_text("Loading best checkpoint for testing...")
 
-    # 加载微调后的最佳模型
-    best_finetuned_path = os.path.join(exp.ckpt_dir, 'best_finetuned_model.pth')
-    if os.path.exists(best_finetuned_path):
-        exp.log_text(f"Loading best finetuned model from {best_finetuned_path}")
-        checkpoint = torch.load(best_finetuned_path, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        # 检查当前模型是否是被 compile 过的
+        if hasattr(model, '_orig_mod'):
+            # 如果是编译过的模型，把参数加载给内部的原始模型
+            model._orig_mod.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            # 如果没编译，正常加载
+            model.load_state_dict(checkpoint['model_state_dict'])
 
     test_results = evaluator_test.evaluate(test_loader)
 
     exp.log_text("=" * 30)
-    exp.log_text("FINAL FINETUNE TEST RESULTS")
-    exp.log_text("=" * 30)
     test_res_str = ", ".join([f"{k}:{v:.4f}" for k, v in test_results.items()])
-    exp.log_text(test_res_str)
-
+    exp.log_text(f"TEST RESULTS: {test_res_str}")
     exp.log_csv('Test', 0.0, test_results, phase='test')
     exp.writer.close()
-    exp.log_text("Finetune Experiment Finished.")
 
 
 if __name__ == "__main__":

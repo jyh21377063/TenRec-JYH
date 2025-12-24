@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import math
 
 
+
 class LayerNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-12):
         super(LayerNorm, self).__init__()
@@ -36,8 +37,6 @@ class SelfAttention(nn.Module):
 
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
         attention_scores = attention_scores / math.sqrt(self.head_size)
-
-        # 加上 mask (mask 值为 0 或 -1e9)
         attention_scores = attention_scores + attention_mask
 
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
@@ -85,144 +84,60 @@ class TransformerBlock(nn.Module):
 
 
 # ==========================================
-# 门控融合层 (Gated Fusion)
+# 新版双塔模型 (Concat Fusion)
 # ==========================================
 
-class GatedFeatureFusion(nn.Module):
-    """
-    实现架构图中的“门控网络动态加权”。
-    输入: 多个不同来源的特征向量列表 [vec1, vec2, ...]
-    输出: 融合后的特征向量
-    """
-
-    def __init__(self, input_dims, output_dim, dropout=0.1):
-        super(GatedFeatureFusion, self).__init__()
-        self.input_dims = input_dims
-        self.output_dim = output_dim
-
-        # 1. 特征投影：将所有输入特征映射到相同的维度
-        self.projectors = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(dim, output_dim),
-                nn.LayerNorm(output_dim),
-                nn.ReLU()
-            ) for dim in input_dims
-        ])
-
-        # 2. 门控网络 (Attention Mechanism)
-        # 它可以根据所有特征的拼接，计算出每个特征组的权重
-        total_dim = output_dim * len(input_dims)
-        self.gate_net = nn.Sequential(
-            nn.Linear(total_dim, output_dim),  # 压缩信息
-            nn.Tanh(),
-            nn.Linear(output_dim, len(input_dims)),  # 输出每个特征组的权重 score
-        )
-
-        self.dropout = nn.Dropout(dropout)
-        self.final_norm = LayerNorm(output_dim)
-
-    def forward(self, feature_list):
-        # 1. 对齐维度
-        projected_feats = []
-        for i, feat in enumerate(feature_list):
-            projected_feats.append(self.projectors[i](feat))
-
-        # projected_feats: List of [B, output_dim]
-
-        # 2. 计算门控权重
-        # 拼接所有特征作为 Context
-        concat_feats = torch.cat(projected_feats, dim=1)  # [B, total_dim]
-
-        # 计算 Attention Scores
-        raw_scores = self.gate_net(concat_feats)  # [B, num_features]
-        attention_weights = F.softmax(raw_scores, dim=1)  # [B, num_features]
-
-        # 3. 加权融合
-        # stack: [B, num_features, output_dim]
-        stack_feats = torch.stack(projected_feats, dim=1)
-
-        # weights: [B, num_features, 1]
-        weights = attention_weights.unsqueeze(-1)
-
-        # Weighted Sum
-        weighted_feats = torch.sum(stack_feats * weights, dim=1)  # [B, output_dim]
-
-        return self.final_norm(weighted_feats + self.dropout(weighted_feats))  # Residual + Norm
-
-
-# ==========================================
-# 3. 进阶双塔模型 (SASRec + Gating + Features)
-# ==========================================
-
-class GatingTwoTowerSASRec(nn.Module):
+class ConcatTwoTowerSASRec(nn.Module):
     def __init__(self, meta_info, embed_dim=64, num_layers=2, num_heads=2, dropout=0.1):
-        super(GatingTwoTowerSASRec, self).__init__()
+        super(ConcatTwoTowerSASRec, self).__init__()
         self.embed_dim = embed_dim
         self.seq_len = meta_info['seq_len']
 
         # ---------------------------------------------------
-        # A. Shared Embeddings (ID & Category)
+        # A. ID & Sequence Embeddings
         # ---------------------------------------------------
         self.item_emb = nn.Embedding(meta_info['num_items'], embed_dim, padding_idx=0)
         self.cat_emb = nn.Embedding(meta_info['num_categories'], embed_dim, padding_idx=0)
-        self.inter_type_emb = nn.Embedding(meta_info['num_inter_types'], embed_dim, padding_idx=0)
-        self.duration_emb = nn.Embedding(meta_info['num_duration_buckets'], embed_dim, padding_idx=0)
-
-        # ---------------------------------------------------
-        # B. User Tower Components
-        # ---------------------------------------------------
-
-        # B.1 序列建模 (Transformer)
         self.pos_emb = nn.Embedding(self.seq_len, embed_dim)
         self.emb_dropout = nn.Dropout(dropout)
+
+        # Transformer
         self.transformer_blocks = nn.ModuleList([
             TransformerBlock(embed_dim, num_heads, dropout) for _ in range(num_layers)
         ])
         self.transformer_norm = LayerNorm(embed_dim)
 
-        # B.2 静态特征 Embeddings (DSSM part)
-        # 假设 Age, Gender, InterType, Duration Bucket
+        # ---------------------------------------------------
+        # B. User Side Features (Profile)
+        # ---------------------------------------------------
+        # 这里的维度你可以自由调整，为了方便，我设为 embed_dim 的一半或相等
         self.age_emb = nn.Embedding(120, embed_dim // 2)
         self.gender_emb = nn.Embedding(5, embed_dim // 2)
-        self.inter_type_emb = nn.Embedding(meta_info.get('num_inter_types', 10), embed_dim, padding_idx=0)
+        # user_activity_norm 是 float，直接用，不需要 Embedding
 
-        # B.3 门控融合层
-        # 输入三部分：Sequence向量, Profile向量, Context向量
-        # Seq维度: embed_dim
-        # Profile维度: (embed_dim//2 * 2) + 1 (activity)
-        # Context维度 (假设 InterType 是 Context): embed_dim
-        self.user_fusion = GatedFeatureFusion(
-            input_dims=[embed_dim, embed_dim + 1, embed_dim],
-            output_dim=embed_dim
-        )
+        # 计算 User Tower 拼接后的总维度
+        # Seq(embed_dim) + Age(embed_dim//2) + Gender(embed_dim//2) + Activity(1)
+        self.user_concat_dim = embed_dim + (embed_dim // 2) + (embed_dim // 2) + 1
 
-        # B.4 最终 MLP
+        # User MLP: 负责把拼接后的长向量压缩回 embed_dim
         self.user_mlp = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(self.user_concat_dim, embed_dim * 2),
             nn.GELU(),
-            nn.Linear(embed_dim, embed_dim)  # Output Embedding
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 2, embed_dim)
         )
 
         # ---------------------------------------------------
         # C. Item Tower Components
         # ---------------------------------------------------
-
-        # C.1 ID 特征处理 (Item ID + Cat ID)
-        # 维度: embed_dim * 2
-
-        # C.2 稠密/其他特征 (Pop, etc)
-        # 维度: 1
-
-        # C.3 门控融合
-        self.item_fusion = GatedFeatureFusion(
-            input_dims=[embed_dim * 2, 1],
-            output_dim=embed_dim
-        )
+        # ID(embed_dim) + Cat(embed_dim) + Pop(1)
+        self.item_concat_dim = embed_dim + embed_dim + 1
 
         self.item_mlp = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(self.item_concat_dim, embed_dim * 2),
             nn.GELU(),
-            nn.Linear(embed_dim, embed_dim)
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim * 2, embed_dim)
         )
 
         self.apply(self._init_weights)
@@ -237,7 +152,6 @@ class GatingTwoTowerSASRec(nn.Module):
             module.bias.data.zero_()
 
     def get_attention_mask(self, item_seq):
-        """生成 Transformer 需要的 Causal Mask"""
         padding_mask = (item_seq == 0).bool()
         batch_size, seq_len = item_seq.size()
         causal_mask = torch.triu(torch.ones((seq_len, seq_len), device=item_seq.device), diagonal=1).bool()
@@ -248,26 +162,17 @@ class GatingTwoTowerSASRec(nn.Module):
 
     def forward_user_tower(self, batch):
         # ==========================
-        # 1. Sequence Feature (SASRec Logic)
+        # 1. Sequence Feature (SASRec)
         # ==========================
         item_seq = batch['item_id_seq']  # (B, L)
         cat_seq = batch['video_category_seq']
-        inter_seq = batch['inter_type_seq']
-        dur_seq = batch['duration_bucket_seq']
 
-        # ==========================
-        # 2. Embedding Lookup
-        # ==========================
-        # 此时它们出来的维度都是 (B, L, embed_dim)
+        # Embedding Lookup
         e_item = self.item_emb(item_seq)
         e_cat = self.cat_emb(cat_seq)
-        e_inter = self.inter_type_emb(inter_seq)
-        e_dur = self.duration_emb(dur_seq)
 
-        # 类似于 BERT 的 input = Token + Segment + Pos
-        # 这里我们是 input = Item + Cat + InterType + Duration
-        seq_emb = e_item + e_cat + e_inter + e_dur
-        # seq_emb = e_item + e_cat
+        # 简单相加融合
+        seq_emb = e_item + e_cat
 
         # Positional Embedding
         positions = torch.arange(self.seq_len, dtype=torch.long, device=item_seq.device)
@@ -275,73 +180,65 @@ class GatingTwoTowerSASRec(nn.Module):
         seq_emb += self.pos_emb(positions)
         seq_emb = self.emb_dropout(seq_emb)
 
-        # Transformer Blocks
+        # Transformer
         mask = self.get_attention_mask(item_seq)
         x = seq_emb
         for block in self.transformer_blocks:
             x = block(x, mask)
         x = self.transformer_norm(x)
 
-        # 取序列最后一个位置的 Embedding 代表“长期兴趣 + 短期意图”
-        seq_feature_vec = x[:, -1, :]  # [B, embed_dim]
+        # 取最后一个有效位置 (B, embed_dim)
+        seq_feature_vec = x[:, -1, :]
 
         # ==========================
-        # 2. User Profile Feature (DSSM Logic)
+        # 2. User Profile Feature
         # ==========================
-        age_vec = self.age_emb(batch['age']).squeeze() if batch['age'].dim() > 1 else self.age_emb(batch['age'])
-        gen_vec = self.gender_emb(batch['gender']).squeeze() if batch['gender'].dim() > 1 else self.gender_emb(
-            batch['gender'])
+        # 确保维度是 [B, dim]
+        age_vec = self.age_emb(batch['age'])
+        if age_vec.dim() == 3: age_vec = age_vec.squeeze(1)
+
+        gen_vec = self.gender_emb(batch['gender'])
+        if gen_vec.dim() == 3: gen_vec = gen_vec.squeeze(1)
+
         act_vec = batch['user_activity_norm']  # [B, 1]
 
-        # 拼接用户静态画像
-        profile_feature_vec = torch.cat([age_vec, gen_vec, act_vec], dim=1)  # [B, D_prof]
+        # ==========================
+        # 3. Concat Fusion
+        # ==========================
+        # 没有任何花哨的操作，直接拼起来
+        user_combined = torch.cat([seq_feature_vec, age_vec, gen_vec, act_vec], dim=1)
 
-        # ==========================
-        # 3. Context Feature (Interaction Logic)
-        # ==========================
-        # 这里为了演示，我们取序列中最近一次交互的类型作为 Context，或者如果有单独的 context 字段更好
-        # 假设 batch['inter_type_seq'] 是序列，我们取最后一个非0的，这里简化取最后一个
-        last_inter_type = batch['inter_type_seq'][:, -1]
-        context_feature_vec = self.inter_type_emb(last_inter_type)  # [B, embed_dim]
+        # MLP 映射
+        user_output = self.user_mlp(user_combined)
 
-        # ==========================
-        # 4. Gated Fusion (门控融合)
-        # ==========================
-        # 融合：[序列特征, 画像特征, 上下文特征]
-        user_fusion_vec = self.user_fusion([seq_feature_vec, profile_feature_vec, context_feature_vec])
-
-        # 最终映射
-        user_output = self.user_mlp(user_fusion_vec)
         return user_output
 
     def forward_item_tower(self, batch):
         # ==========================
-        # 1. ID Features
+        # 1. Features
         # ==========================
         item_id = batch['item_id']
         cat_id = batch['video_category']
-
-        id_vec = torch.cat([self.item_emb(item_id), self.cat_emb(cat_id)], dim=1)  # [B, 2*embed_dim]
-
-        # ==========================
-        # 2. Dense/Content Features
-        # ==========================
         pop_vec = batch['item_pop_norm']  # [B, 1]
-        # 如果有图像/文本 Embedding，可以在这里加入 list
+
+        e_item = self.item_emb(item_id)
+        e_cat = self.cat_emb(cat_id)
 
         # ==========================
-        # 3. Gated Fusion
+        # 2. Concat Fusion
         # ==========================
-        item_fusion_vec = self.item_fusion([id_vec, pop_vec])
+        item_combined = torch.cat([e_item, e_cat, pop_vec], dim=1)
 
-        item_output = self.item_mlp(item_fusion_vec)
+        # MLP 映射
+        item_output = self.item_mlp(item_combined)
+
         return item_output
 
     def forward(self, batch):
         u_emb = self.forward_user_tower(batch)
         i_emb = self.forward_item_tower(batch)
 
-        # 归一化 (为 InfoNCE / Cosine Loss 做准备)
+        # Normalize for Cosine Similarity
         u_emb = F.normalize(u_emb, p=2, dim=1)
         i_emb = F.normalize(i_emb, p=2, dim=1)
 

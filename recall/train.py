@@ -14,6 +14,9 @@ from datetime import datetime
 from dataset import SBRDataset
 from model.dssm.dssm import TwoTowerModel
 from model.dssm.sas_dssm import GatingTwoTowerSASRec
+from model.dssm.sas_dssm_simple import ConcatTwoTowerSASRec
+from model.dssm.sas_dssm_residual import ResidualSASRec,GatedResidualSASRec
+from model.dssm.sas_dssm_profile import ProfilePromptSASRec
 from model.sequence.sasrec import SASRecRecallModel
 from model.sequence.comirec import MINDModel
 from evaluation import Evaluator
@@ -33,7 +36,7 @@ CONFIG = {
     'main_metric': 'Recall@20',  # 用于判断模型好坏的主指标
     'weight_decay': 1e-5,  # 增加一点正则化
     'tau': 0.1,  # 温度系数
-    'model': 'SASTT',  # 模型：DSSM SAS MIND SASTT
+    'model': 'GRSAS',  # 模型：DSSM SAS MIND SASTT SSAS RSAS PSAS GRSAS
 }
 
 
@@ -225,6 +228,14 @@ def train():
         ).to(device)
     elif CONFIG['model'] == 'SASTT':
         model = GatingTwoTowerSASRec(meta).to(device)
+    elif CONFIG['model'] == 'SSAS':
+        model = ConcatTwoTowerSASRec(meta).to(device)
+    elif CONFIG['model'] == 'RSAS':
+        model = ResidualSASRec(meta).to(device)
+    elif CONFIG['model'] == 'PSAS':
+        model = ProfilePromptSASRec(meta).to(device)
+    elif CONFIG['model'] == 'GRSAS':
+        model = GatedResidualSASRec(meta).to(device)
     else:
         model = TwoTowerModel(meta).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG['lr'], weight_decay=CONFIG['weight_decay'])
