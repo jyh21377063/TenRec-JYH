@@ -6,15 +6,17 @@ from tqdm import tqdm
 
 from config import Config
 from dataset import MTLDataManager
-from model.mtl.mmoe import MMOE,MMOE_SEQ
-from model.mtl.esmm import ESMM,ESMM_SEQ
-from model.mtl.ple import PLE_SEQ
+from model.mtl.mmoe import MMOE,MMOE_SEQ,MMOE_DIN,MMOE_DCN_DIN
+from model.mtl.esmm import ESMM,ESMM_SEQ,ESMM_DIN,ESMM_DCN_DIN
+from model.mtl.ple import PLE_SEQ,PLE_DIN,PLE_DCN_DIN
 from utils import ExperimentLogger, EarlyStopping
 from evaluation import Evaluator
 
 
-def train():
+def train(model_name):
     # 1. 初始化实验记录器
+    Config.model_name = model_name
+    Config.experiment_name = f"{model_name}_v1"
     logger = ExperimentLogger(Config)
 
     # 2. 加载数据
@@ -42,7 +44,7 @@ def train():
     print(f"User Features: {list(user_feature_dict.keys())}")
     print(f"Item Features: {list(item_feature_dict.keys())}")
 
-    model_name = Config.model_name
+    # model_name = Config.model_name
 
     if model_name=='MMOE':
         model = MMOE(
@@ -70,6 +72,34 @@ def train():
             num_task=data_manager.get_num_tasks(),
             device=Config.device
         ).to(Config.device)
+    elif model_name == 'MMOE_DIN':
+        model = MMOE_DIN(
+            user_feature_dict=user_feature_dict,
+            item_feature_dict=item_feature_dict,
+            emb_dim=Config.emb_dim,
+            n_expert=Config.n_expert,
+            mmoe_hidden_dim=Config.mmoe_hidden_dim,
+            hidden_dim=Config.hidden_dim,
+            din_hidden_dim=Config.din_hidden_dim,
+            dropouts=Config.dropouts,
+            output_size=1,
+            num_task=data_manager.get_num_tasks(),
+            device=Config.device
+        ).to(Config.device)
+    elif model_name == 'MMOE_DCN_DIN':
+        model = MMOE_DCN_DIN(
+            user_feature_dict=user_feature_dict,
+            item_feature_dict=item_feature_dict,
+            emb_dim=Config.emb_dim,
+            n_expert=Config.n_expert,
+            mmoe_hidden_dim=Config.mmoe_hidden_dim,
+            hidden_dim=Config.hidden_dim,
+            din_hidden_dim=Config.din_hidden_dim,
+            dropouts=Config.dropouts,
+            output_size=1,
+            num_task=data_manager.get_num_tasks(),
+            device=Config.device
+        ).to(Config.device)
     elif model_name == 'PLE_SEQ':
         # PLE 需要 n_specific_experts 和 n_shared_experts
         model = PLE_SEQ(
@@ -80,6 +110,38 @@ def train():
             n_shared_experts=Config.n_shared_experts,
             mmoe_hidden_dim=Config.mmoe_hidden_dim,
             hidden_dim=Config.hidden_dim,
+            dropouts=Config.dropouts,
+            output_size=1,
+            num_task=data_manager.get_num_tasks(),
+            device=Config.device
+        ).to(Config.device)
+    elif model_name == 'PLE_DIN':
+        # PLE 需要 n_specific_experts 和 n_shared_experts
+        model = PLE_DIN(
+            user_feature_dict=user_feature_dict,
+            item_feature_dict=item_feature_dict,
+            emb_dim=Config.emb_dim,
+            n_specific_experts=Config.n_specific_experts,
+            n_shared_experts=Config.n_shared_experts,
+            mmoe_hidden_dim=Config.mmoe_hidden_dim,
+            hidden_dim=Config.hidden_dim,
+            din_hidden_dim=Config.din_hidden_dim,
+            dropouts=Config.dropouts,
+            output_size=1,
+            num_task=data_manager.get_num_tasks(),
+            device=Config.device
+        ).to(Config.device)
+    elif model_name == 'PLE_DCN_DIN':
+        # PLE 需要 n_specific_experts 和 n_shared_experts
+        model = PLE_DCN_DIN(
+            user_feature_dict=user_feature_dict,
+            item_feature_dict=item_feature_dict,
+            emb_dim=Config.emb_dim,
+            n_specific_experts=Config.n_specific_experts,
+            n_shared_experts=Config.n_shared_experts,
+            mmoe_hidden_dim=Config.mmoe_hidden_dim,
+            hidden_dim=Config.hidden_dim,
+            din_hidden_dim=Config.din_hidden_dim,
             dropouts=Config.dropouts,
             output_size=1,
             num_task=data_manager.get_num_tasks(),
@@ -101,6 +163,28 @@ def train():
             item_feature_dict=item_feature_dict,
             emb_dim=Config.emb_dim,
             hidden_dim=Config.hidden_dim,
+            dropouts=Config.dropouts,
+            output_size=1,
+            num_task=data_manager.get_num_tasks(),
+        ).to(Config.device)
+    elif model_name=='ESMM_DIN':
+        model = ESMM_DIN(
+            user_feature_dict=user_feature_dict,
+            item_feature_dict=item_feature_dict,
+            emb_dim=Config.emb_dim,
+            hidden_dim=Config.hidden_dim,
+            din_hidden_dim=Config.din_hidden_dim,
+            dropouts=Config.dropouts,
+            output_size=1,
+            num_task=data_manager.get_num_tasks(),
+        ).to(Config.device)
+    elif model_name=='ESMM_DCN_DIN':
+        model = ESMM_DCN_DIN(
+            user_feature_dict=user_feature_dict,
+            item_feature_dict=item_feature_dict,
+            emb_dim=Config.emb_dim,
+            hidden_dim=Config.hidden_dim,
+            din_hidden_dim=Config.din_hidden_dim,
             dropouts=Config.dropouts,
             output_size=1,
             num_task=data_manager.get_num_tasks(),
@@ -244,4 +328,11 @@ def train():
 
 
 if __name__ == '__main__':
-    train()
+    model_names = [
+        # "MMOE", "MMOE_SEQ", "MMOE_DIN",
+        "MMOE_DCN_DIN",
+        "PLE_SEQ", "PLE_DIN", "PLE_DCN_DIN",
+        "ESMM_SEQ", "ESMM_DIN","ESMM_DCN_DIN",
+    ]
+    for n in model_names:
+        train(model_name=n)
