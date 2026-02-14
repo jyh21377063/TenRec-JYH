@@ -35,7 +35,7 @@ class SBRDataset(Dataset):
 
         # A. 离散特征 (Sparse) -> LongTensor
         # item_id, video_category, gender, age
-        sparse_keys = ['item_id', 'video_category', 'gender', 'age']
+        sparse_keys = ['item_id', 'video_category', 'gender', 'age', 'user_id']
 
         for key in sparse_keys:
             if key in data_dict:

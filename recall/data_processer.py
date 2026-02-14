@@ -201,5 +201,5 @@ def process_two_tower(file_path, save_path, seq_len=20):
 
 if __name__ == "__main__":
     file_path = '../../data/sbr_data_1M.csv'
-    save_path = '../../data/sbr_data_1208.pkl'
-    process_two_tower(file_path, save_path, seq_len=20)
+    save_path = '../../data/sbr_data_0214.pkl'
+    process_two_tower(file_path, save_path, seq_len=30)

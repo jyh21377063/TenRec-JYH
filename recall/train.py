@@ -17,6 +17,8 @@ from model.dssm.sas_dssm import GatingTwoTowerSASRec
 from model.dssm.sas_dssm_simple import ConcatTwoTowerSASRec
 from model.dssm.sas_dssm_residual import ResidualSASRec,GatedResidualSASRec
 from model.dssm.sas_dssm_profile import ProfilePromptSASRec
+from model.sota.person_residual_sas_dssm import PersonalizedResidualSASRec
+from model.sota.share_profile_sas_dssm import SharedPreFusionSASRec
 from model.sequence.sasrec import SASRecRecallModel
 from model.sequence.comirec import MINDModel
 from evaluation import Evaluator
@@ -28,15 +30,15 @@ from loss import InfoNCELoss
 CONFIG = {
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     'batch_size': 4096,
-    'lr': 1e-3,
+    'lr': 1e-4,
     'epochs': 50,  # 设大一点，依靠 Early Stopping 停下来
-    'patience': 3,  # 容忍多少个 epoch 指标不提升
+    'patience': 5,  # 容忍多少个 epoch 指标不提升
     'data_path': '../../data/sbr_data_1208.pkl',
     'exp_dir': '../../experiments',  # 实验结果根目录
-    'main_metric': 'Recall@20',  # 用于判断模型好坏的主指标
+    'main_metric': 'NDCG@10',  # 用于判断模型好坏的主指标
     'weight_decay': 1e-5,  # 增加一点正则化
     'tau': 0.1,  # 温度系数
-    'model': 'GRSAS',  # 模型：DSSM SAS MIND SASTT SSAS RSAS PSAS GRSAS
+    'model': 'SPFSAS',  # 模型：DSSM SAS MIND SASTT SSAS RSAS PSAS GRSAS PRSAS SPFSAS
 }
 
 
@@ -236,6 +238,11 @@ def train():
         model = ProfilePromptSASRec(meta).to(device)
     elif CONFIG['model'] == 'GRSAS':
         model = GatedResidualSASRec(meta).to(device)
+    elif CONFIG['model'] == 'PRSAS':
+        model = PersonalizedResidualSASRec(meta).to(device)
+    elif CONFIG['model'] == 'SPFSAS':
+        print("SharedPreFusionSASRec...")
+        model = SharedPreFusionSASRec(meta).to(device)
     else:
         model = TwoTowerModel(meta).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG['lr'], weight_decay=CONFIG['weight_decay'])
