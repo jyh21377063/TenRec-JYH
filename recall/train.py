@@ -38,6 +38,7 @@ CONFIG = {
     'main_metric': 'NDCG@10',  # 用于判断模型好坏的主指标
     'weight_decay': 1e-5,  # 增加一点正则化
     'tau': 0.1,  # 温度系数
+    'use_hard_neg': True,  # 是否使用热度负样本
     'model': 'SPFSAS',  # 模型：DSSM SAS MIND SASTT SSAS RSAS PSAS GRSAS PRSAS SPFSAS
 }
 
@@ -256,6 +257,7 @@ def train():
 
     # 全局 Step 计数器
     global_step = 0
+    use_hard_neg = CONFIG['use_hard_neg']
 
     for epoch in range(1, CONFIG['epochs'] + 1):
         model.train()
@@ -270,10 +272,34 @@ def train():
 
             # Forward
             u_emb, i_emb = model(batch)
+            neg_i_emb = None
+
+            if use_hard_neg and 'neg_item_id' in batch:
+                # 构造负样本 Batch
+                item_features = ['item_id', 'video_category', 'item_pop_norm']  # 根据你的模型定义
+                neg_batch = {k: batch[f'neg_{k}'] if f'neg_{k}' in batch else batch[k]
+                             for k in item_features}
+
+                # 防御性获取 side info (防止某些旧模型没用 side info)
+                if 'neg_video_category' in batch:
+                    neg_batch['video_category'] = batch['neg_video_category']
+                if 'neg_item_pop_norm' in batch:
+                    neg_batch['item_pop_norm'] = batch['neg_item_pop_norm']
+
+                # 计算 Embedding
+                if hasattr(model, 'forward_item_tower'):
+                    # 直接调用你在 model 里定义好的 forward_item_tower 方法
+                    neg_i_emb = model.forward_item_tower(neg_batch)
+                    # 记得手动归一化，因为 forward_item_tower 里只做了 LayerNorm，没做 F.normalize
+                    # 但我看你的 loss.py 里又做了一次 F.normalize，所以这里输出原始向量没问题
+                else:
+                    # 兼容其他模型的 fallback (假设其他模型有 item_tower 属性)
+                    neg_i_emb = model.item_tower(neg_batch)
 
             # In-Batch Negatives
             # (B, D) x (D, B) -> (B, B)
-            loss = criterion(u_emb, i_emb)
+            # 如果 neg_i_emb 是 None，loss 函数会自动退化回普通 InfoNCE
+            loss = criterion(u_emb, i_emb, neg_i_emb)
 
             # Backward
             optimizer.zero_grad()

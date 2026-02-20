@@ -4,6 +4,66 @@ from sklearn.preprocessing import LabelEncoder, MinMaxScaler
 import pickle
 import gc
 from tqdm import tqdm
+import random
+
+
+def generate_pop_negatives(df, train_mask, item_count, num_neg=30,seed=42):
+    print("   [Negative Sampling] Generating Popularity-based Negatives...")
+    np.random.seed(seed)
+
+    # 1. 统计热度并计算采样概率 (参考 neg_sampler.py 的 items_by_popularity)
+    # 只统计训练集的热度，防止泄露
+    train_df = df[train_mask]
+    popularity = train_df['item_id'].value_counts()
+
+    # 构建所有物品的概率分布
+    # 注意 item_id 是从 1 开始编码的，0 是 padding
+    counts = np.zeros(item_count + 1)
+    # 填充出现的物品热度
+    counts[popularity.index] = popularity.values
+
+    # 平滑处理：频率的 0.75 次方 (Word2Vec 经典做法)
+    counts = counts ** 0.75
+    # 归一化
+    probs = counts / np.sum(counts)
+
+    # 2. 准备用户的历史交互集合 (用于去重)
+    # 这里的 df 是全量数据，按 user_id 排序过的
+    user_groups = df.groupby('user_id')['item_id'].apply(set)
+    user_history_map = user_groups.to_dict()
+
+    # 3. 对每一行训练数据采样
+    # 我们只需要给 train_mask 为 True 的行生成负样本
+    train_indices = np.where(train_mask)[0]
+    neg_items_matrix = np.zeros((len(df), num_neg), dtype=np.int32)
+
+    # 预先生成一大批候选 (Batch Sampling)
+    # 因为我们要填满 num_neg 个坑，所以候选池要更大
+    candidate_pool_size = int(len(train_indices) * num_neg * 1.5)
+    candidate_pool = np.random.choice(len(probs), size=candidate_pool_size, p=probs)
+    pool_idx = 0
+
+    for idx in tqdm(train_indices, desc="Sampling Negatives Pool"):
+        uid = df.at[idx, 'user_id']
+        seen = user_history_map.get(uid, set())
+
+        # 每个用户填满 num_neg 个负样本
+        collected = []
+        while len(collected) < num_neg:
+            if pool_idx >= len(candidate_pool):
+                candidate_pool = np.random.choice(len(probs), size=candidate_pool_size, p=probs)
+                pool_idx = 0
+
+            cand = candidate_pool[pool_idx]
+            pool_idx += 1
+
+            # 必须不是 padding (0) 且不在用户历史中，且当前轮次没采过（防止这30个里有重复）
+            if cand != 0 and cand not in seen and cand not in collected:
+                collected.append(cand)
+
+        neg_items_matrix[idx] = np.array(collected, dtype=np.int32)
+
+    return neg_items_matrix
 
 
 def process_two_tower(file_path, save_path, seq_len=20):
@@ -75,6 +135,11 @@ def process_two_tower(file_path, save_path, seq_len=20):
     # 4. 生成 Mask
     train_mask = (df['reverse_idx'] >= 2)
     # 注意：这里我们只生成 train_mask 用于特征工程，val/test mask 后面切分数据时再用
+    # 生成负样本列
+    # 注意：这里需要 item_id 的最大值
+    num_items = int(df['item_id'].max())
+    neg_col = generate_pop_negatives(df, train_mask, num_items)
+    # df['neg_item_id'] = neg_col
 
     # ============================
     # 3. 增强特征工程
@@ -168,6 +233,14 @@ def process_two_tower(file_path, save_path, seq_len=20):
         # 2. 序列特征
         for seq_name, matrix in seq_data_dict.items():
             subset_data[seq_name] = matrix[indices]
+        # 3. 负样本 (直接切片外部的 numpy 数组)
+        # 只要外部变量 neg_col 存在，就直接切片保存
+        # 不需要判断 df.columns，也不用 locals()
+        try:
+            subset_data['neg_item_pool'] = neg_col[indices]
+        except NameError:
+            print("Warning: neg_col variable not found, skipping negative samples.")
+            pass
         return subset_data
 
     dataset = {
@@ -184,7 +257,8 @@ def process_two_tower(file_path, save_path, seq_len=20):
             'user_tower_dense': ['user_activity_norm', 'age', 'gender'],
             'user_tower_seq': [f'{c}_seq' for c in target_seq_cols],
             'item_pop_map': item_pop_map,  # 这里存的是修正后的 map
-            'item_tower_sparse': ['item_id', 'video_category']
+            'item_tower_sparse': ['item_id', 'video_category'],
+            'has_negatives': True
         }
     }
 

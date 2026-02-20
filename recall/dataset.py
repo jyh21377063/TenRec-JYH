@@ -43,6 +43,15 @@ class SBRDataset(Dataset):
                 # 使用 from_numpy 共享内存，直到原数据被删除
                 self.tensors[key] = torch.from_numpy(data_dict[key].astype(np.int64))
 
+        # 特判 neg_item_id
+        if 'neg_item_pool' in data_dict:
+            # 形状: [样本数, 30]
+            self.neg_pool = torch.from_numpy(data_dict['neg_item_pool'].astype(np.int64))
+            self.num_neg_candidates = self.neg_pool.size(1)  # 30
+            self.has_hard_neg = True
+        else:
+            self.has_hard_neg = False
+
         # B. 连续/稠密特征 (Dense) -> FloatTensor
         # user_activity_norm, item_pop_norm
         dense_keys = ['user_activity_norm', 'item_pop_norm']
@@ -67,7 +76,7 @@ class SBRDataset(Dataset):
         if 'click' in data_dict:
             self.tensors['label'] = torch.from_numpy(data_dict['click'].astype(np.float32))
 
-        if mode == 'train' and hard_neg_path:
+        if mode == 'train' and (hard_neg_path or self.has_hard_neg):
             max_item = self.meta['num_items']
             self.item_cat_lookup = torch.zeros(max_item, dtype=torch.long)
             self.item_pop_lookup = torch.zeros(max_item, 1, dtype=torch.float32)
@@ -127,16 +136,22 @@ class SBRDataset(Dataset):
         # 这里的切片操作非常快，且返回的已经是 Tensor，无需再次转换
         batch = {k: v[idx] for k, v in self.tensors.items()}
 
-        if hasattr(self, 'hard_negs') and self.hard_negs is not None:
-            hn_ids = self.hard_negs[idx]  # 这里拿到的是 (K, ) 的 numpy 数组
+        if self.mode == 'train' and self.has_hard_neg:
+            # 1. 随机从 0 到 29 选一个索引
+            rand_idx = torch.randint(low=0, high=self.num_neg_candidates, size=(1,)).item()
 
-            # 转换为 Tensor (K, )
-            hn_id_tensor = torch.tensor(hn_ids, dtype=torch.long)
+            # 2. 取出这一个负样本 ID
+            # self.neg_pool 是 (N, 30)，我们取 self.neg_pool[idx, rand_idx]
+            neg_id = self.neg_pool[idx, rand_idx]
 
-            # 存入 batch
-            batch['hn_item_id'] = hn_id_tensor
-            batch['hn_video_category'] = self.item_cat_lookup[hn_id_tensor]
-            batch['hn_item_pop_norm'] = self.item_pop_lookup[hn_id_tensor]
+            # 3. 放入 batch，让模型觉得这只是一个普通的 item_id
+            # 注意：这里 neg_id 是一个 scalar (标量)，不需要 unsqueeze，除非你的模型特定要求
+            batch['neg_item_id'] = neg_id
+
+            # 4. 查表获取负样本的属性 (Category, Popularity 等)
+            # 注意：item_cat_lookup 接收的是 LongTensor
+            batch['neg_video_category'] = self.item_cat_lookup[neg_id]
+            batch['neg_item_pop_norm'] = self.item_pop_lookup[neg_id]
         return batch
 
     def get_meta(self):
