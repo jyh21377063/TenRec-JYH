@@ -24,28 +24,55 @@ class Evaluator:
 
         with torch.no_grad():
             for batch in tqdm(loader, desc="Evaluating", leave=False):
-                # === 更新 1：显式解包 4 个值 ===
-                x_sparse, seq_item, seq_bhv, y = batch
+                # 显式解包 3 个值
+                x_sparse, x_seq, y = batch
 
+                # 放到 GPU
                 x_sparse = x_sparse.to(self.device)
-                seq_item = seq_item.to(self.device)
-                seq_bhv = seq_bhv.to(self.device)
+                x_seq = x_seq.to(self.device)
                 y = y.to(self.device)
 
-                # === 更新 2：调用三输入的 forward ===
-                # AdvancedMMOE 输出形状: [B, num_tasks]
-                outputs = model(x_sparse, seq_item, seq_bhv)
+                outputs = model(x_sparse, x_seq)
                 batch_loss = 0
 
+                # === 修复点 1 & 2: 提取判断逻辑，兼容所有 ESMM 变体 ===
                 if 'ESMM' in self.model_name:
-                    # ESMM 逻辑保持你的原样，注意它通常输出 Tuple，所以按需微调
-                    # ... [原有的 ESMM 逻辑] ...
-                    pass
+                    # === ESMM 专属逻辑 (一次性处理所有任务) ===
+                    logits_ctr = outputs[0]
+                    logits_cvr = outputs[1]
+
+                    label_ctr = y[:, 0:1]
+                    label_cvr = y[:, 1:2]
+                    label_ctcvr = label_ctr * label_cvr
+
+                    # 概率计算
+                    pctr = torch.sigmoid(logits_ctr)
+                    pcvr = torch.sigmoid(logits_cvr)
+                    pctcvr = pctr * pcvr
+
+                    # --- Loss 计算 ---
+                    loss_ctr = criterion(logits_ctr, label_ctr)
+
+                    # Task 2: CTCVR Loss (手写 BCE，因为 pctcvr 已经是概率)
+                    epsilon = 1e-10
+                    loss_ctcvr = - (label_ctcvr * torch.log(pctcvr + epsilon) +
+                                    (1 - label_ctcvr) * torch.log(1 - pctcvr + epsilon)).mean()
+
+                    batch_loss += (loss_ctr + loss_ctcvr)
+
+                    # --- 指标记录 ---
+                    # Task 1 (Index 0)
+                    y_trues[0].extend(label_ctr.cpu().numpy().flatten())
+                    y_preds[0].extend(pctr.cpu().numpy().flatten())
+
+                    # Task 2 (Index 1) -> 注意这里存的是 CTCVR
+                    y_trues[1].extend(label_ctcvr.cpu().numpy().flatten())
+                    y_preds[1].extend(pctcvr.cpu().numpy().flatten())
+
                 else:
-                    # === 更新 3：兼容 AdvancedMMOE 的输出维度切片 ===
+                    # 2. 其他模型 (MMOE / SharedBottom / PLE 等) 走通用循环
                     for i, name in enumerate(self.target_names):
-                        # outputs 的列切片
-                        logits = outputs[:, i:i + 1]
+                        logits = outputs[i]
                         label = y[:, i:i + 1]
 
                         batch_loss += criterion(logits, label)
