@@ -112,8 +112,8 @@ class MTLDataManager:
         sparse_cols = self.meta_info['sparse_cols']
         feature_dims = self.meta_info.get('feature_dims', {})
 
-        # 获取全局默认的 embedding 维度，若未设置默认为 128
-        default_emb_dim = getattr(self.cfg, 'emb_dim', 128)
+        # 获取全局默认的 embedding 维度，若未设置默认为 64
+        default_emb_dim = getattr(self.cfg, 'emb_dim', 64)
 
         # === 在这里手动设置你的自定义特征维度 ===
         # 一般经验法则：dim = 6 * (vocab_size ** 0.25) ，或者凭经验设置

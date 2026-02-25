@@ -9,6 +9,7 @@ from tqdm import tqdm
 from config import Config
 from dataset import MTLDataManager
 from model.sota.mmoe import AdvancedMMOE
+from model.sota.ple import AdvancedCGC
 from utils import ExperimentLogger, EarlyStopping
 from evaluation import Evaluator
 
@@ -67,11 +68,16 @@ def train(model_name):
         model = AdvancedMMOE(
             feature_dict=all_feature_dict,  # 注意: AdvancedMMOE 初始化需要完整的 feature_dict
             max_seq_len=Config.max_seq_len,
-            emb_dim=Config.emb_dim,
+            # emb_dim=Config.emb_dim,
             # num_tasks = len(Config.use_targets),
             device=Config.device
         ).to(Config.device)
-
+    elif model_name == 'CGC':
+        model = AdvancedCGC(
+            feature_dict=all_feature_dict,
+            max_seq_len=Config.max_seq_len,
+            device=Config.device
+        ).to(Config.device)
     else:
         raise NotImplementedError
 
@@ -84,7 +90,7 @@ def train(model_name):
     else:
         logger.log(f"Using Manual Weighting for Loss. Weights: {Config.task_weights}")
 
-    # =对 Embedding 层施加特定的 Weight Decay
+    # 对 Embedding 层施加特定的 Weight Decay
     embedding_params = []
     other_params = []
 
@@ -96,7 +102,8 @@ def train(model_name):
 
     # 配置优化器组
     opt_groups = [
-        {'params': model.parameters(), 'weight_decay': getattr(Config, 'weight_decay', 1e-6)}
+        {'params': embedding_params, 'weight_decay': 0.0},  # No L2 penalty for sparse embeddings
+        {'params': other_params, 'weight_decay': getattr(Config, 'weight_decay', 1e-6)}
     ]
 
     # 如果启用了自动加权，将其参数加入优化器，学习率建议设小一点防止震荡
@@ -140,7 +147,6 @@ def train(model_name):
                     # 注意 logits 的切片
                     task_losses.append(criterion(logits[:, i:i + 1], y[:, i:i + 1]))
 
-                # === 新增：Loss 的路由计算 ===
                 if awl is not None:
                     loss = awl(task_losses)
                 else:
@@ -153,7 +159,7 @@ def train(model_name):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             scaler.step(optimizer)
             scaler.update()
-            total_loss += loss.detach()
+            total_loss += loss.item()
 
             global_step += 1
 
@@ -215,6 +221,6 @@ def train(model_name):
 
 
 if __name__ == '__main__':
-    model_names = ["MMOE"]
+    model_names = ["CGC"]
     for n in model_names:
         train(model_name=n)

@@ -5,14 +5,16 @@ from layer.din import MultiHeadTargetAttention
 from layer.dcn import CrossNetV2
 
 
-class AdvancedMMOE(nn.Module):
+class AdvancedCGC(nn.Module):
     def __init__(self, feature_dict, max_seq_len=30,
-                 num_experts=4, mmoe_hidden_dim=256,
+                 num_specific_experts=2, num_shared_experts=2, expert_hidden_dim=256,
                  task_hidden_dims=[128, 64], num_tasks=2, drop_rate=0.3, device='cpu'):
-        super(AdvancedMMOE, self).__init__()
+        super(AdvancedCGC, self).__init__()
 
         self.feature_dict = feature_dict
         self.num_tasks = num_tasks
+        self.num_specific_experts = num_specific_experts
+        self.num_shared_experts = num_shared_experts
 
         # --- Step 1: 基础表示层 (Embedding Layer) ---
         self.embeddings = nn.ModuleDict({
@@ -20,49 +22,48 @@ class AdvancedMMOE(nn.Module):
             for col, (vocab_size, feat_dim, _) in feature_dict.items()
         })
 
-        # 序列专属 Embedding
         self.item_emb_dim = feature_dict['item_id'][1]
-        # 0: padding, 1: click, 2: like, 3: follow, 4: share (总共5个)
         self.bhv_emb = nn.Embedding(5, self.item_emb_dim)
-        # 位置编码
         self.pos_emb = nn.Embedding(max_seq_len, self.item_emb_dim)
 
-        # 提取 item_id 和 user_id 在 sparse_x 中的索引，方便后续提取
         self.item_idx = feature_dict['item_id'][2]
         self.user_idx = feature_dict['user_id'][2]
-        self.user_emb_dim = feature_dict['user_id'][1] # 提取用户实际的emb_dim
+        self.user_emb_dim = feature_dict['user_id'][1]
 
         # --- Step 2: 序列兴趣抽取层 (Sequence Modeling) ---
         self.target_attention = MultiHeadTargetAttention(emb_dim=self.item_emb_dim, num_heads=4)
 
         # --- Step 3: 特征交叉层 (纯 DCN-v2) ---
         total_sparse_dim = sum(feat_dim for _, feat_dim, _ in feature_dict.values())
-        # 修复维度对齐：拼接维度 = sparse总维 + 序列聚合出的维度(item_emb_dim)
         concat_dim = total_sparse_dim + self.item_emb_dim
-
         self.cross_net = CrossNetV2(in_features=concat_dim, layer_num=3)
 
-        # 移除 Deep Net，直接将原始特征和 Cross 特征拼接
         shared_dim = concat_dim * 2
 
-        # --- Step 4: 多任务路由层 (MMoE) ---
-        # 将共享 DNN 内化到 Expert 中：使得每个 Expert 成为一个真正的深度网络
-        self.experts = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(shared_dim, 512),
-                nn.BatchNorm1d(512),
-                nn.ReLU(),
-                nn.Dropout(drop_rate),
-                nn.Linear(512, mmoe_hidden_dim),
-                nn.ReLU()
-            ) for _ in range(num_experts)
+        # --- Step 4: 多任务路由层 (CGC - 单层 PLE) ---
+        # 1. 构造共享专家 (Shared Experts)
+        self.shared_experts = nn.ModuleList([
+            self._build_expert(shared_dim, expert_hidden_dim, drop_rate)
+            for _ in range(self.num_shared_experts)
         ])
 
+        # 2. 构造任务专属专家 (Task-Specific Experts)
+        # 结构为 ModuleList(ModuleList(Expert)), 维度为 [num_tasks, num_specific_experts]
+        self.specific_experts = nn.ModuleList([
+            nn.ModuleList([
+                self._build_expert(shared_dim, expert_hidden_dim, drop_rate)
+                for _ in range(self.num_specific_experts)
+            ]) for _ in range(self.num_tasks)
+        ])
+
+        # 3. 构造任务门控 (Task Gates)
+        # CGC 中，每个任务的门控掌管: 自己的 specific 专家 + 所有的 shared 专家
+        num_experts_per_task = self.num_specific_experts + self.num_shared_experts
         self.gates = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(shared_dim, num_experts),
+                nn.Linear(shared_dim, num_experts_per_task),
                 nn.Softmax(dim=-1)
-            ) for _ in range(num_tasks)
+            ) for _ in range(self.num_tasks)
         ])
 
         # --- Step 5: 个性化任务塔 (PPNet-style Task Towers) ---
@@ -73,7 +74,7 @@ class AdvancedMMOE(nn.Module):
         for _ in range(num_tasks):
             # Task Tower
             tower = []
-            input_dim = mmoe_hidden_dim
+            input_dim = expert_hidden_dim
             for out_dim in task_hidden_dims:
                 tower.append(nn.Linear(input_dim, out_dim))
                 tower.append(nn.BatchNorm1d(out_dim))
@@ -82,10 +83,9 @@ class AdvancedMMOE(nn.Module):
                 input_dim = out_dim
             self.task_towers.append(nn.Sequential(*tower))
 
-            # PPNet Gate: 输入为 user_emb，输出维度与 Task Tower 最后一层隐藏层对齐
+            # PPNet Gate
             self.ppnet_gates.append(nn.Linear(self.user_emb_dim, task_hidden_dims[-1]))
-
-            # 最终输出层 (Binary Classification Logits)
+            # 最终输出层
             self.task_out_layers.append(nn.Linear(task_hidden_dims[-1], 1))
 
         for gate in self.ppnet_gates:
@@ -93,66 +93,76 @@ class AdvancedMMOE(nn.Module):
             if gate.bias is not None:
                 nn.init.zeros_(gate.bias)
 
+    def _build_expert(self, in_dim, out_dim, drop_rate):
+        """辅助函数：构建单个 Expert 网络"""
+        return nn.Sequential(
+            nn.Linear(in_dim, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(drop_rate),
+            nn.Linear(512, out_dim),
+            nn.ReLU()
+        )
+
     def forward(self, sparse_x, seq_item, seq_bhv):
         B = sparse_x.size(0)
 
         # --- Step 1: 基础表示 ---
         sparse_embs = []
-        # 前向传播时，解包三元组获取索引
         for col, (_, _, idx) in self.feature_dict.items():
             sparse_embs.append(self.embeddings[col](sparse_x[:, idx]))
 
         user_emb = self.embeddings['user_id'](sparse_x[:, self.user_idx])
-        target_item_emb = self.embeddings['item_id'](sparse_x[:, self.item_idx]).unsqueeze(1)  # [B, 1, E]
+        target_item_emb = self.embeddings['item_id'](sparse_x[:, self.item_idx]).unsqueeze(1)
 
         # --- Step 2: 序列兴趣抽取 ---
-        seq_item_e = self.embeddings['item_id'](seq_item)  # [B, L, E]
-        seq_bhv_e = self.bhv_emb(seq_bhv)  # [B, L, E]
+        seq_item_e = self.embeddings['item_id'](seq_item)
+        seq_bhv_e = self.bhv_emb(seq_bhv)
 
-        # 动态生成位置索引并 lookup
         seq_len = seq_item.size(1)
         positions = torch.arange(seq_len, device=seq_item.device).unsqueeze(0).expand(B, -1)
-        seq_pos_e = self.pos_emb(positions)  # [B, L, E]
+        seq_pos_e = self.pos_emb(positions)
 
         seq_e_fused = seq_item_e + seq_bhv_e + seq_pos_e
         mask = (seq_item > 0)
-
         hist_emb = self.target_attention(target_item_emb, seq_e_fused, mask)
 
         # --- Step 3: 特征交叉 ---
         flat_sparse = torch.cat(sparse_embs, dim=-1)
-        x_in = torch.cat([flat_sparse, hist_emb], dim=-1)  # [B, concat_dim]
+        x_in = torch.cat([flat_sparse, hist_emb], dim=-1)
 
-        # 计算显式特征交叉
-        x_cross = self.cross_net(x_in)  # [B, concat_dim]
+        x_cross = self.cross_net(x_in)
+        x_shared = torch.cat([x_in, x_cross], dim=-1)
 
-        # 拼装：原始特征直接和高阶显式交叉特征结合，保留原始信息并跳过共享 DNN 的信息衰减
-        x_shared = torch.cat([x_in, x_cross], dim=-1)  # [B, 2 * concat_dim]
-
-        # --- Step 4: MMoE ---
-        expert_outputs = torch.stack([expert(x_shared) for expert in self.experts], dim=1)  # [B, num_experts, mmoe_dim]
+        # --- Step 4: CGC (单层 PLE) ---
+        # 1. 计算所有 Shared Experts 的输出
+        # shared_expert_outputs: List of Tensors, length = num_shared_experts
+        shared_expert_outputs = [expert(x_shared) for expert in self.shared_experts]
 
         task_inputs = []
         for i in range(self.num_tasks):
-            gate_weights = self.gates[i](x_shared).unsqueeze(-1)  # [B, num_experts, 1]
-            task_in = torch.sum(expert_outputs * gate_weights, dim=1)  # [B, mmoe_dim]
+            # 2. 计算当前任务专属 Specific Experts 的输出
+            specific_expert_outputs = [expert(x_shared) for expert in self.specific_experts[i]]
+
+            # 3. 将当前任务的专属专家和共享专家拼接起来
+            # [B, num_specific_experts + num_shared_experts, expert_dim]
+            all_experts_for_task = torch.stack(specific_expert_outputs + shared_expert_outputs, dim=1)
+
+            # 4. 计算当前任务的 Gate 权重
+            gate_weights = self.gates[i](x_shared).unsqueeze(-1)  # [B, num_experts_per_task, 1]
+
+            # 5. 加权求和得到当前任务的输入
+            task_in = torch.sum(all_experts_for_task * gate_weights, dim=1)  # [B, expert_dim]
             task_inputs.append(task_in)
 
         # --- Step 5: PPNet 个性化任务塔 ---
         task_outputs = []
         for i in range(self.num_tasks):
-            # 过普通的 DNN Tower
-            tower_out = self.task_towers[i](task_inputs[i])  # [B, task_hidden_dims[-1]]
-
-            # 计算 User 个性化 Gate: Gate = 2 * Sigmoid(Linear(E_user))
-            # 乘以 2 是为了让初始门控期望在 1 附近，便于梯度传播 (LHUC 标准做法)
+            tower_out = self.task_towers[i](task_inputs[i])
             user_gate = 2.0 * torch.sigmoid(self.ppnet_gates[i](user_emb))
-
-            # 门控融合
             tower_out_personalized = tower_out * user_gate
 
-            # 输出 Logits
             logit = self.task_out_layers[i](tower_out_personalized)
-            task_outputs.append(logit.squeeze(-1))  # [B]
+            task_outputs.append(logit.squeeze(-1))
 
-        return torch.stack(task_outputs, dim=1)  # 输出维度变为 [B, num_tasks]
+        return torch.stack(task_outputs, dim=1)
