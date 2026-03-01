@@ -81,6 +81,13 @@ class SBRDataset(Dataset):
             self.item_cat_lookup = torch.zeros(max_item, dtype=torch.long)
             self.item_pop_lookup = torch.zeros(max_item, 1, dtype=torch.float32)
 
+            self.item_log_p_lookup = torch.zeros(max_item, dtype=torch.float32)
+            self.item_neg_log_p_lookup = torch.zeros(max_item, dtype=torch.float32)
+            for item_id, log_p in self.meta['item_log_p_map'].items():
+                self.item_log_p_lookup[item_id] = log_p
+            for item_id, neg_log_p in self.meta['item_neg_log_p_map'].items():
+                self.item_neg_log_p_lookup[item_id] = neg_log_p
+
             print("Building Global Item Lookup Table...")
             # 方案：我们需要访问所有数据来填满这个表。
             # 如果 data 包含了 train/val/test，我们遍历一遍来覆盖
@@ -136,6 +143,10 @@ class SBRDataset(Dataset):
         # 这里的切片操作非常快，且返回的已经是 Tensor，无需再次转换
         batch = {k: v[idx] for k, v in self.tensors.items()}
 
+        if self.mode == 'train':
+            item_id = batch['item_id'].item() if isinstance(batch['item_id'], torch.Tensor) else batch['item_id']
+            batch['item_log_p'] = self.item_log_p_lookup[item_id]
+
         if self.mode == 'train' and self.has_hard_neg:
             # 1. 随机从 0 到 29 选一个索引
             rand_idx = torch.randint(low=0, high=self.num_neg_candidates, size=(1,)).item()
@@ -152,6 +163,7 @@ class SBRDataset(Dataset):
             # 注意：item_cat_lookup 接收的是 LongTensor
             batch['neg_video_category'] = self.item_cat_lookup[neg_id]
             batch['neg_item_pop_norm'] = self.item_pop_lookup[neg_id]
+            batch['neg_item_log_p'] = self.item_neg_log_p_lookup[neg_id]
         return batch
 
     def get_meta(self):

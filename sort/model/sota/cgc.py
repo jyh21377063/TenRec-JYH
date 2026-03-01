@@ -5,11 +5,11 @@ from layer.din import MultiHeadTargetAttention
 from layer.dcn import CrossNetV2
 
 
-class AdvancedPLE(nn.Module):
+class AdvancedCGC(nn.Module):
     def __init__(self, feature_dict, max_seq_len=30,
                  num_specific_experts=2, num_shared_experts=2, expert_hidden_dim=256,
                  task_hidden_dims=[128, 64], num_tasks=2, drop_rate=0.3, device='cpu'):
-        super(AdvancedPLE, self).__init__()
+        super(AdvancedCGC, self).__init__()
 
         self.feature_dict = feature_dict
         self.num_tasks = num_tasks
@@ -30,66 +30,38 @@ class AdvancedPLE(nn.Module):
         self.user_idx = feature_dict['user_id'][2]
         self.user_emb_dim = feature_dict['user_id'][1]
 
-        # --- Step 2: 序列兴趣抽取层 ---
+        # --- Step 2: 序列兴趣抽取层 (Sequence Modeling) ---
         self.target_attention = MultiHeadTargetAttention(emb_dim=self.item_emb_dim, num_heads=4)
 
-        # --- Step 3: 特征交叉层 ---
+        # --- Step 3: 特征交叉层 (纯 DCN-v2) ---
         total_sparse_dim = sum(feat_dim for _, feat_dim, _ in feature_dict.values())
         concat_dim = total_sparse_dim + self.item_emb_dim
         self.cross_net = CrossNetV2(in_features=concat_dim, layer_num=3)
 
         shared_dim = concat_dim * 2
 
-        # ==============================================================
-        # --- Step 4: 多任务路由层 (Two-Layer PLE) ---
-        # ==============================================================
-
-        # ---------------- Layer 1 ----------------
-        # L1 Experts
-        self.l1_shared_experts = nn.ModuleList([
+        # --- Step 4: 多任务路由层 (CGC - 单层 PLE) ---
+        # 1. 构造共享专家 (Shared Experts)
+        self.shared_experts = nn.ModuleList([
             self._build_expert(shared_dim, expert_hidden_dim, drop_rate)
             for _ in range(self.num_shared_experts)
         ])
-        self.l1_specific_experts = nn.ModuleList([
+
+        # 2. 构造任务专属专家 (Task-Specific Experts)
+        # 结构为 ModuleList(ModuleList(Expert)), 维度为 [num_tasks, num_specific_experts]
+        self.specific_experts = nn.ModuleList([
             nn.ModuleList([
                 self._build_expert(shared_dim, expert_hidden_dim, drop_rate)
                 for _ in range(self.num_specific_experts)
             ]) for _ in range(self.num_tasks)
         ])
 
-        # L1 Gates
+        # 3. 构造任务门控 (Task Gates)
+        # CGC 中，每个任务的门控掌管: 自己的 specific 专家 + 所有的 shared 专家
         num_experts_per_task = self.num_specific_experts + self.num_shared_experts
-        num_all_experts = self.num_tasks * self.num_specific_experts + self.num_shared_experts
-
-        self.l1_gates = nn.ModuleList([
+        self.gates = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(shared_dim, num_experts_per_task),
-                nn.Softmax(dim=-1)
-            ) for _ in range(self.num_tasks)
-        ])
-        # Shared Gate: 融合 L1 所有的专家，传给 L2 的 Shared Experts
-        self.l1_shared_gate = nn.Sequential(
-            nn.Linear(shared_dim, num_all_experts),
-            nn.Softmax(dim=-1)
-        )
-
-        # ---------------- Layer 2 ----------------
-        # L2 Experts (输入维度变为 expert_hidden_dim)
-        self.l2_shared_experts = nn.ModuleList([
-            self._build_expert(expert_hidden_dim, expert_hidden_dim, drop_rate)
-            for _ in range(self.num_shared_experts)
-        ])
-        self.l2_specific_experts = nn.ModuleList([
-            nn.ModuleList([
-                self._build_expert(expert_hidden_dim, expert_hidden_dim, drop_rate)
-                for _ in range(self.num_specific_experts)
-            ]) for _ in range(self.num_tasks)
-        ])
-
-        # L2 Gates (最终输出给 Task Tower 的 Gate)
-        self.l2_gates = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(expert_hidden_dim, num_experts_per_task),
                 nn.Softmax(dim=-1)
             ) for _ in range(self.num_tasks)
         ])
@@ -100,6 +72,7 @@ class AdvancedPLE(nn.Module):
         self.task_out_layers = nn.ModuleList()
 
         for _ in range(num_tasks):
+            # Task Tower
             tower = []
             input_dim = expert_hidden_dim
             for out_dim in task_hidden_dims:
@@ -110,7 +83,9 @@ class AdvancedPLE(nn.Module):
                 input_dim = out_dim
             self.task_towers.append(nn.Sequential(*tower))
 
+            # PPNet Gate
             self.ppnet_gates.append(nn.Linear(self.user_emb_dim, task_hidden_dims[-1]))
+            # 最终输出层
             self.task_out_layers.append(nn.Linear(task_hidden_dims[-1], 1))
 
         for gate in self.ppnet_gates:
@@ -119,13 +94,13 @@ class AdvancedPLE(nn.Module):
                 nn.init.zeros_(gate.bias)
 
     def _build_expert(self, in_dim, out_dim, drop_rate):
-        """ 专家网络的内部维度可以适当缩减以防过拟合 (这里用 256) """
+        """辅助函数：构建单个 Expert 网络"""
         return nn.Sequential(
-            nn.Linear(in_dim, 256),
-            nn.BatchNorm1d(256),
+            nn.Linear(in_dim, 512),
+            nn.BatchNorm1d(512),
             nn.ReLU(),
             nn.Dropout(drop_rate),
-            nn.Linear(256, out_dim),
+            nn.Linear(512, out_dim),
             nn.ReLU()
         )
 
@@ -155,47 +130,30 @@ class AdvancedPLE(nn.Module):
         # --- Step 3: 特征交叉 ---
         flat_sparse = torch.cat(sparse_embs, dim=-1)
         x_in = torch.cat([flat_sparse, hist_emb], dim=-1)
+
         x_cross = self.cross_net(x_in)
         x_shared = torch.cat([x_in, x_cross], dim=-1)
 
-        # --- Step 4: Two-Layer PLE ---
-        # -------- Layer 1 --------
-        l1_shared_expert_outs = [expert(x_shared) for expert in self.l1_shared_experts]
-
-        l1_specific_expert_outs = []
-        l1_task_outs = []
-
-        for i in range(self.num_tasks):
-            # 获取当前任务在L1的专属专家输出
-            spec_outs = [expert(x_shared) for expert in self.l1_specific_experts[i]]
-            l1_specific_expert_outs.append(spec_outs)
-
-            # 融合计算当前任务 L1 的输出 (专属专家 + 共享专家)
-            all_experts_for_task = torch.stack(spec_outs + l1_shared_expert_outs, dim=1)
-            gate_weights = self.l1_gates[i](x_shared).unsqueeze(-1)
-            l1_task_outs.append(torch.sum(all_experts_for_task * gate_weights, dim=1))
-
-        # 计算 L1 的 Shared Gate 输出 (所有专家融合)
-        all_l1_experts_flat = []
-        for outs in l1_specific_expert_outs:
-            all_l1_experts_flat.extend(outs)
-        all_l1_experts_flat.extend(l1_shared_expert_outs)
-
-        l1_shared_gate_w = self.l1_shared_gate(x_shared).unsqueeze(-1)
-        l1_shared_out = torch.sum(torch.stack(all_l1_experts_flat, dim=1) * l1_shared_gate_w, dim=1)
-
-        # -------- Layer 2 --------
-        l2_shared_expert_outs = [expert(l1_shared_out) for expert in self.l2_shared_experts]
+        # --- Step 4: CGC (单层 PLE) ---
+        # 1. 计算所有 Shared Experts 的输出
+        # shared_expert_outputs: List of Tensors, length = num_shared_experts
+        shared_expert_outputs = [expert(x_shared) for expert in self.shared_experts]
 
         task_inputs = []
         for i in range(self.num_tasks):
-            # L2专属专家输入来自对应任务的 L1 输出
-            spec_outs = [expert(l1_task_outs[i]) for expert in self.l2_specific_experts[i]]
+            # 2. 计算当前任务专属 Specific Experts 的输出
+            specific_expert_outputs = [expert(x_shared) for expert in self.specific_experts[i]]
 
-            all_experts_for_task = torch.stack(spec_outs + l2_shared_expert_outs, dim=1)
-            # L2 Task Gate 输入也是对应任务的 L1 输出
-            gate_weights = self.l2_gates[i](l1_task_outs[i]).unsqueeze(-1)
-            task_inputs.append(torch.sum(all_experts_for_task * gate_weights, dim=1))
+            # 3. 将当前任务的专属专家和共享专家拼接起来
+            # [B, num_specific_experts + num_shared_experts, expert_dim]
+            all_experts_for_task = torch.stack(specific_expert_outputs + shared_expert_outputs, dim=1)
+
+            # 4. 计算当前任务的 Gate 权重
+            gate_weights = self.gates[i](x_shared).unsqueeze(-1)  # [B, num_experts_per_task, 1]
+
+            # 5. 加权求和得到当前任务的输入
+            task_in = torch.sum(all_experts_for_task * gate_weights, dim=1)  # [B, expert_dim]
+            task_inputs.append(task_in)
 
         # --- Step 5: PPNet 个性化任务塔 ---
         task_outputs = []

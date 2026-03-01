@@ -274,6 +274,9 @@ def train():
             u_emb, i_emb = model(batch)
             neg_i_emb = None
 
+            key_log_p = batch.get('item_log_p', None)
+            neg_log_p = batch.get('neg_item_log_p', None)
+
             if use_hard_neg and 'neg_item_id' in batch:
                 # 构造负样本 Batch
                 item_features = ['item_id', 'video_category', 'item_pop_norm']  # 根据你的模型定义
@@ -299,7 +302,7 @@ def train():
             # In-Batch Negatives
             # (B, D) x (D, B) -> (B, B)
             # 如果 neg_i_emb 是 None，loss 函数会自动退化回普通 InfoNCE
-            loss = criterion(u_emb, i_emb, neg_i_emb)
+            loss = criterion(u_emb, i_emb, neg_i_emb, key_log_p, neg_log_p)
 
             # Backward
             optimizer.zero_grad()

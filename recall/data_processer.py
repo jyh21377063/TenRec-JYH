@@ -151,6 +151,25 @@ def process_two_tower(file_path, save_path, seq_len=20):
     train_df = df[train_mask]
     train_pop_map = train_df['item_id'].value_counts().to_dict()
 
+    # 计算 In-Batch 采样的真实概率 (基于原始频次)
+    total_train_clicks = sum(train_pop_map.values())
+    item_prob_dict = {k: v / total_train_clicks for k, v in train_pop_map.items()}
+
+    # 计算 Hard Negative 的采样概率 (基于 0.75 次方平滑)
+    smooth_counts = {k: v ** 0.75 for k, v in train_pop_map.items()}
+    total_smooth_clicks = sum(smooth_counts.values())
+    item_neg_prob_dict = {k: v / total_smooth_clicks for k, v in smooth_counts.items()}
+
+    # 映射到全量 Item ID，遇到缺失值给一个极小的默认概率 (避免 log(0))
+    min_prob = 1e-9
+    df['item_log_p'] = np.log(df['item_id'].map(item_prob_dict).fillna(min_prob))
+    df['item_neg_log_p'] = np.log(df['item_id'].map(item_neg_prob_dict).fillna(min_prob))
+
+    # 提取唯一的映射表供 Dataset 查表使用
+    log_p_map = df[['item_id', 'item_log_p', 'item_neg_log_p']].drop_duplicates().set_index('item_id')
+    item_log_p_map = log_p_map['item_log_p'].to_dict()
+    item_neg_log_p_map = log_p_map['item_neg_log_p'].to_dict()
+
     # 映射到全量数据
     # 测试集中出现的新物品(训练集没见过的)，热度填充为 0 (符合冷启动逻辑)
     df['item_pop_count'] = df['item_id'].map(train_pop_map).fillna(0)
@@ -256,7 +275,9 @@ def process_two_tower(file_path, save_path, seq_len=20):
             'seq_len': seq_len,
             'user_tower_dense': ['user_activity_norm', 'age', 'gender'],
             'user_tower_seq': [f'{c}_seq' for c in target_seq_cols],
-            'item_pop_map': item_pop_map,  # 这里存的是修正后的 map
+            'item_pop_map': item_pop_map,
+            'item_log_p_map': item_log_p_map,
+            'item_neg_log_p_map': item_neg_log_p_map,
             'item_tower_sparse': ['item_id', 'video_category'],
             'has_negatives': True
         }

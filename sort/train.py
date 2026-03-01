@@ -9,7 +9,8 @@ from tqdm import tqdm
 from config import Config
 from dataset import MTLDataManager
 from model.sota.mmoe import AdvancedMMOE
-from model.sota.ple import AdvancedCGC
+from model.sota.cgc import AdvancedCGC
+from model.sota.ple import AdvancedPLE
 from utils import ExperimentLogger, EarlyStopping
 from evaluation import Evaluator
 
@@ -74,6 +75,12 @@ def train(model_name):
         ).to(Config.device)
     elif model_name == 'CGC':
         model = AdvancedCGC(
+            feature_dict=all_feature_dict,
+            max_seq_len=Config.max_seq_len,
+            device=Config.device
+        ).to(Config.device)
+    elif model_name == 'PLE':
+        model = AdvancedPLE(
             feature_dict=all_feature_dict,
             max_seq_len=Config.max_seq_len,
             device=Config.device
@@ -221,6 +228,6 @@ def train(model_name):
 
 
 if __name__ == '__main__':
-    model_names = ["CGC"]
+    model_names = ["PLE"]
     for n in model_names:
         train(model_name=n)

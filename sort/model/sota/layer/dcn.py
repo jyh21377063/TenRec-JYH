@@ -18,11 +18,9 @@ class CrossNetV2(nn.Module):
             nn.init.zeros_(self.cross_bias[i])
 
     def forward(self, x):
-        # Force to float32 for stability
-        x_0 = x.float()
-        x_l = x.float()
+        x_0 = x
+        x_l = x
         for i in range(self.layer_num):
-            # Weights should also match dtype
-            xl_w = torch.matmul(x_l, self.cross_weights[i].float()) + self.cross_bias[i].float()
+            xl_w = torch.matmul(x_l, self.cross_weights[i]) + self.cross_bias[i]
             x_l = x_0 * xl_w + x_l
-        return x_l.to(x.dtype)  # Convert back to original dtype (FP16)
+        return x_l
