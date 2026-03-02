@@ -11,6 +11,7 @@ from dataset import MTLDataManager
 from model.sota.mmoe import AdvancedMMOE
 from model.sota.cgc import AdvancedCGC
 from model.sota.ple import AdvancedPLE
+from model.sota.changed_cgc import ChangedCGC
 from utils import ExperimentLogger, EarlyStopping
 from evaluation import Evaluator
 
@@ -78,6 +79,14 @@ def train(model_name):
             feature_dict=all_feature_dict,
             max_seq_len=Config.max_seq_len,
             device=Config.device
+        ).to(Config.device)
+    elif model_name == 'CCGC':
+        model = ChangedCGC(
+            feature_dict=all_feature_dict,
+            max_seq_len=Config.max_seq_len,
+            device=Config.device,
+            use_dcn=getattr(Config, 'use_dcn', True),
+            use_ppnet=getattr(Config, 'use_ppnet', True)
         ).to(Config.device)
     elif model_name == 'PLE':
         model = AdvancedPLE(
@@ -228,6 +237,6 @@ def train(model_name):
 
 
 if __name__ == '__main__':
-    model_names = ["PLE"]
+    model_names = ["CCGC"]
     for n in model_names:
         train(model_name=n)

@@ -36,3 +36,5 @@ class Config:
     emb_dim = 64
     max_seq_len = 30
     patience = 5
+    use_dcn = False
+    use_ppnet = False
